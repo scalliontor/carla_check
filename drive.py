@@ -4,15 +4,13 @@ import numpy as np
 import cv2
 import torchvision.transforms as transforms
 from PIL import Image
-import time
+import queue
 
 # ==============================================================================
 # -- Model Definition (MUST BE EXACTLY THE SAME AS IN THE TRAINING SCRIPT) =====
 # ==============================================================================
-# It's best practice to have this in a separate file and import it,
-# but for simplicity, we will copy it directly here.
-
 class ResidualBlock(torch.nn.Module):
+    # ... (Copy the class definition exactly from your training script) ...
     def __init__(self, in_channels, out_channels, stride=1):
         super(ResidualBlock, self).__init__()
         self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
@@ -34,6 +32,7 @@ class ResidualBlock(torch.nn.Module):
         return out
 
 class ResNetSteering(torch.nn.Module):
+    # ... (Copy the class definition exactly from your training script) ...
     def __init__(self, block, layers):
         super(ResNetSteering, self).__init__()
         self.in_channels = 64
@@ -71,93 +70,134 @@ class ResNetSteering(torch.nn.Module):
 
 
 # ==============================================================================
-# -- Global Variables and Pre-processing ---------------------------------------
+# -- Image Pre-processing ------------------------------------------------------
 # ==============================================================================
-
-current_steering_angle = 0.0
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-# Define the exact same transformations as in your training script
 transform = transforms.Compose([
     transforms.Resize((220, 220)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-def image_callback(image, model):
-    """
-    Callback function that is called every time the camera receives a new image.
-    This is the heart of the inference loop.
-    """
-    global current_steering_angle
-    
-    # Convert CARLA image to a PIL Image for torchvision transforms
+def process_image(image, model):
+    """Processes a CARLA image and returns a steering angle prediction."""
+    # Convert CARLA image to PIL Image
     array = np.frombuffer(image.raw_data, dtype=np.uint8)
     array = np.reshape(array, (image.height, image.width, 4))
-    array = array[:, :, :3]  # Remove alpha channel (BGRA to BGR)
-    pil_image = Image.fromarray(cv2.cvtColor(array, cv2.COLOR_BGR2RGB)) # Convert BGR to RGB
+    array = array[:, :, :3]
+    pil_image = Image.fromarray(cv2.cvtColor(array, cv2.COLOR_BGR2RGB))
     
-    # Apply transformations and add a batch dimension
+    # Apply transformations
     image_tensor = transform(pil_image).unsqueeze(0).to(device)
     
-    # Make a prediction
+    # Predict steering angle
     with torch.no_grad():
         prediction = model(image_tensor)
-        current_steering_angle = prediction.item()
+        steering_angle = prediction.item()
+    
+    return steering_angle
+
 
 def main():
-    """Main function to run the autonomous driving."""
+    """Main function for synchronous autonomous driving."""
     client, world, vehicle, camera = None, None, None, None
+    original_settings = None
+    
     try:
-        # --- Load the trained model ---
+        # --- Load Model ---
         print("Loading trained model...")
         model = ResNetSteering(ResidualBlock, [2, 2, 2, 2]).to(device)
         model.load_state_dict(torch.load('best_model.pth'))
-        model.eval()  # Set the model to evaluation mode
+        model.eval()
         print("Model loaded successfully!")
         
-        # --- Connect to CARLA and spawn actors ---
+        # --- Connect to CARLA and enable Synchronous Mode ---
         client = carla.Client('localhost', 2000)
         client.set_timeout(10.0)
         world = client.get_world()
-
+        
+        original_settings = world.get_settings()
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05  # 20 FPS
+        world.apply_settings(settings)
+        
+        # --- Spawn Actors ---
         blueprint_library = world.get_blueprint_library()
         vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
-        spawn_point = world.get_map().get_spawn_points()[15] # Use a different spawn point for fun
+        
+        # Spawn at a known good location
+        location = carla.Location(x=180.0, y=59.0, z=0.3)
+        rotation = carla.Rotation(pitch=0.0, yaw=-90.0, roll=0.0)
+        spawn_point = world.get_map().get_spawn_points()[10] 
         vehicle = world.spawn_actor(vehicle_bp, spawn_point)
         print("Vehicle spawned.")
         
         camera_bp = blueprint_library.find('sensor.camera.rgb')
-        # Use a resolution that's easy to process
         camera_bp.set_attribute('image_size_x', '800')
         camera_bp.set_attribute('image_size_y', '600')
         camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
         camera = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
         
-        # Start the camera listening and pass the loaded model to the callback
-        camera.listen(lambda image: image_callback(image, model))
+        # Create a synchronous queue to hold camera data
+        image_queue = queue.Queue()
+        camera.listen(image_queue.put)
         
+        spectator = world.get_spectator()
+
         # --- Main Control Loop ---
-        print("Starting control loop...")
+        print("Starting synchronous control loop...")
         while True:
-            # Set a constant throttle for simplicity
-            throttle = 0.6
+            # Advance the simulation and wait for the next frame
+            world.tick()
             
-            # Create the control command with the model's prediction
-            control = carla.VehicleControl(
-                throttle=throttle,
-                steer=current_steering_angle
-            )
+            # Get the camera image from the queue
+            image = image_queue.get()
             
-            # Apply the control to the vehicle
+            # Predict the steering angle
+            steering_angle = process_image(image, model)
+            
+            # --- BUG FIX #2: Invert Steering Here ---
+            # If the car turns left when it should turn right, uncomment the next line
+            # steering_angle = -steering_angle
+
+            # Apply control
+            control = carla.VehicleControl(throttle=0.5, steer=steering_angle)
             vehicle.apply_control(control)
+
+            # Move spectator camera to follow the car
+            vehicle_transform = vehicle.get_transform()
+                        # --- THE DEFINITIVE V2 Spectator Follow Logic ---
+            # Get the vehicle's current transform
+            transform = vehicle.get_transform()
             
-            # Add a small delay to keep the loop from running too fast
-            time.sleep(0.05)
+            # Get the vehicle's rotation
+            rotation = transform.rotation
+
+            # Define our desired offset IN THE CAR'S LOCAL COORDINATE SYSTEM
+            # x=-10 is 10m behind, z=5 is 5m up
+            offset = carla.Location(x=-10.0, z=5.0)
+
+            # The magic is here: Rotate the offset vector by the vehicle's rotation.
+            # This transforms the local offset (e.g., "behind me") into a world-space direction.
+            world_offset = rotation.get_forward_vector() * offset.x + rotation.get_right_vector() * offset.y + rotation.get_up_vector() * offset.z
             
+            # Calculate the final world position for the spectator
+            spectator_location = transform.location + world_offset
+            
+            # The rotation should look from the spectator towards the vehicle.
+            # A simple chase-cam uses the car's yaw with a fixed downward pitch.
+            spectator_rotation = carla.Rotation(pitch=-15.0, yaw=transform.rotation.yaw)
+            
+            # Set the new transform for the spectator
+            spectator.set_transform(carla.Transform(spectator_location, spectator_rotation))
+            # --- END OF DEFINITIVE V2 LOGIC ---
     finally:
         # --- Cleanup ---
-        print("\nCleaning up actors...")
+        print("\nCleaning up actors and restoring settings...")
+        if original_settings:
+            world.apply_settings(original_settings)
         if camera: camera.destroy()
         if vehicle: vehicle.destroy()
         print("Cleanup complete.")
